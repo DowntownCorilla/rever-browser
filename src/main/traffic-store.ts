@@ -235,9 +235,70 @@ export function getRequest(requestId: string): StoredRequest | undefined {
   return entries.get(requestId)
 }
 
+// ── responseReceivedExtraInfo merge ─────────────────────────────────────────
+// Network.responseReceived.response.headers omits Set-Cookie (verified against
+// Chrome via CDP: the event's header map carries no Set-Cookie even when the
+// server sets one). Chromium delivers the complete raw header block in
+// Network.responseReceivedExtraInfo instead — the same event Puppeteer uses
+// for rawHeaders. Ordering of the two events is not guaranteed, so whichever
+// arrives first is buffered here and merged when the other lands.
+//
+// Redirect hops share the requestId, so a buffered block may belong to an
+// earlier hop than the response being stored. The block's own statusCode is
+// kept alongside so callers can tell a 302's headers from the final 200's.
+const pendingExtraResponseHeaders = new Map<
+  string,
+  { statusCode: number; headers: Record<string, string> }
+>()
+const MAX_PENDING_EXTRA_RESPONSE_HEADERS = 1000
+
+export function mergeExtraResponseHeaders(
+  requestId: string,
+  extraHeaders: Record<string, string>,
+  statusCode: number
+): void {
+  const existing = entries.get(requestId)
+  if (existing?.responseHeaders) {
+    // responseReceived already arrived — merge in place. ExtraInfo is the
+    // raw authoritative block, so it wins for shared names (Chromium folds
+    // repeated Set-Cookie into one '\n'-joined value). A block whose
+    // statusCode doesn't match belongs to a different hop of this requestId:
+    // if its responseReceived hasn't landed yet (redirect, auth retry) it is
+    // re-buffered so that event's statusCode check can pick it up; a truly
+    // stale block just expires via the cap.
+    if (existing.status === undefined || existing.status === statusCode) {
+      existing.responseHeaders = { ...existing.responseHeaders, ...extraHeaders }
+      return
+    }
+  }
+  if (pendingExtraResponseHeaders.size >= MAX_PENDING_EXTRA_RESPONSE_HEADERS) {
+    const oldest = pendingExtraResponseHeaders.keys().next().value
+    if (oldest !== undefined) pendingExtraResponseHeaders.delete(oldest)
+  }
+  pendingExtraResponseHeaders.set(requestId, { statusCode, headers: extraHeaders })
+}
+
+export function takePendingExtraResponseHeaders(
+  requestId: string,
+  statusCode: number
+): Record<string, string> | undefined {
+  const extra = pendingExtraResponseHeaders.get(requestId)
+  if (!extra) return undefined
+  pendingExtraResponseHeaders.delete(requestId)
+  // Only hand the block over when it describes the response that just
+  // arrived — a redirect hop's block shares the requestId but not the status.
+  if (extra.statusCode !== statusCode) return undefined
+  return extra.headers
+}
+
+export function discardPendingExtraResponseHeaders(requestId: string): void {
+  pendingExtraResponseHeaders.delete(requestId)
+}
+
 export function clearTraffic() {
   order.length = 0
   entries.clear()
   wsFrames.clear()
+  pendingExtraResponseHeaders.clear()
   totalBodyBytes = 0
 }
