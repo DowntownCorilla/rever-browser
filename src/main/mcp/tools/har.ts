@@ -28,7 +28,9 @@ export function registerHarTools(mcp: McpServer) {
     async ({ host, limit, includeBodies = true }) => {
       try {
         const entries = listRequests({ host, limit: limit ?? 500 })
-        const harEntries = entries.map((r) => {
+        const harEntries: Record<string, unknown>[] = []
+        let skippedEntries = 0
+        entries.forEach((r) => {
           const full = getRequest(r.requestId) ?? r
           const startedDateTime = new Date(full.startedAt).toISOString()
           const timeMs = full.completedAt ? full.completedAt - full.startedAt : -1
@@ -36,13 +38,22 @@ export function registerHarTools(mcp: McpServer) {
           const reqHeaders = toHeaders(full.requestHeaders)
           const respHeaders = toHeaders(full.responseHeaders)
 
-          const reqUrl = new URL(full.url)
-          const queryString = Array.from(reqUrl.searchParams.entries()).map(([name, value]) => ({
-            name,
-            value
-          }))
+          // A single entry whose URL won't parse (chrome://, devtools://,
+          // empty) used to kill the whole export with "Invalid URL" — skip
+          // it per-entry and surface the count on the log instead.
+          let queryString: { name: string; value: string }[]
+          try {
+            const reqUrl = new URL(full.url)
+            queryString = Array.from(reqUrl.searchParams.entries()).map(([name, value]) => ({
+              name,
+              value
+            }))
+          } catch {
+            skippedEntries += 1
+            return
+          }
 
-          return {
+          harEntries.push({
             startedDateTime,
             time: timeMs,
             request: {
@@ -97,14 +108,15 @@ export function registerHarTools(mcp: McpServer) {
               wait: timeMs > 0 ? timeMs : -1,
               receive: 0
             }
-          }
+          })
         })
 
         const har = {
           log: {
             version: '1.2',
             creator: { name: 'rever-browser', version: '0.1.0' },
-            entries: harEntries
+            entries: harEntries,
+            ...(skippedEntries > 0 ? { _skippedEntries: skippedEntries } : {})
           }
         }
 
