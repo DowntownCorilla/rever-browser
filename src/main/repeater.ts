@@ -29,6 +29,14 @@ export interface RepeaterResponse {
 
 const MAX_BODY_BYTES = 64 * 1024
 
+// The in-page fetch() had no timeout at all — if the target never finishes
+// its response (a server that logs an error but leaves the request hanging),
+// the fetch never settles and permanently occupies one of the browser's
+// per-origin connection slots. Keep this below the CDP-level
+// Runtime.evaluate timeout (30_000 in repeaterSendRaw) so AbortController
+// fires first and reliably returns the slot.
+const FETCH_TIMEOUT_MS = 15_000
+
 // fetch() refuses to set these. Strip them from copied request headers and from
 // caller-provided overrides so the page-side fetch doesn't throw a TypeError.
 const FORBIDDEN_HEADER_RE =
@@ -112,7 +120,8 @@ export async function repeaterSendRaw(spec: RepeaterRequestSpec): Promise<Repeat
   const cleanedHeaders = dropForbidden(spec.headers)
   const expression = buildEvalExpression(
     { ...spec, headers: cleanedHeaders },
-    MAX_BODY_BYTES
+    MAX_BODY_BYTES,
+    FETCH_TIMEOUT_MS
   )
 
   const result = (await target.dbg.sendCommand('Runtime.evaluate', {
@@ -149,21 +158,28 @@ export async function repeaterSend(
   return repeaterSendRaw(buildRequestSpec(requestId, mods))
 }
 
-function buildEvalExpression(spec: RepeaterRequestSpec, maxBytes: number): string {
+function buildEvalExpression(spec: RepeaterRequestSpec, maxBytes: number, timeoutMs: number): string {
   const hasBody = spec.body !== undefined && spec.method !== 'GET' && spec.method !== 'HEAD'
   return `
 (async () => {
   const t0 = performance.now()
+  // Without an AbortController a target that never ends its response leaves
+  // this fetch() unsettled forever, permanently occupying one of the
+  // browser's per-origin connection slots.
+  const __revAc = new AbortController()
+  const __revTimer = setTimeout(() => __revAc.abort(), ${timeoutMs})
   try {
     const init = {
       method: ${JSON.stringify(spec.method)},
       headers: ${JSON.stringify(spec.headers)},
       credentials: 'include',
       redirect: 'follow',
-      cache: 'no-store'
+      cache: 'no-store',
+      signal: __revAc.signal
     }
     ${hasBody ? `init.body = ${JSON.stringify(spec.body)}` : ''}
     const res = await fetch(${JSON.stringify(spec.url)}, init)
+    clearTimeout(__revTimer)
     const buf = await res.arrayBuffer()
     const bytes = new Uint8Array(buf)
     const total = bytes.length
@@ -194,6 +210,8 @@ function buildEvalExpression(spec: RepeaterRequestSpec, maxBytes: number): strin
       timeMs: Math.round(performance.now() - t0)
     }
   } catch (e) {
+    clearTimeout(__revTimer)
+    const isAbort = e && (e.name === 'AbortError')
     return {
       status: 0,
       statusText: '',
@@ -202,7 +220,9 @@ function buildEvalExpression(spec: RepeaterRequestSpec, maxBytes: number): strin
       bodyTruncated: false,
       bodyByteLength: 0,
       timeMs: Math.round(performance.now() - t0),
-      error: (e && e.message) ? e.message : String(e)
+      error: isAbort
+        ? 'repeater: fetch aborted after ${timeoutMs}ms with no response (target likely hung)'
+        : ((e && e.message) ? e.message : String(e))
     }
   }
 })()
