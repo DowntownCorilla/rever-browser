@@ -557,8 +557,14 @@ export const VISUALIZER_INIT_SCRIPT = `
     hud.appendChild(row)
     s.appendChild(hud)
     pending.push(hud)
-    // Cap the stack — evict the oldest (top) cards past the limit.
-    while (s.children.length > MAX_CARDS) {
+    // Cap the stack — evict the oldest (top) card past the limit. This call
+    // adds exactly one card, so at most one is ever over the cap here — a
+    // plain if fully drains it. removeCard() only marks the card as out and
+    // defers the real DOM removal 320ms via setTimeout, so children.length
+    // never shrinks inside a synchronous loop — as a while loop this spun
+    // forever and froze the page's JS thread on the 6th non-browser tool
+    // call of a session.
+    if (s.children.length > MAX_CARDS) {
       const top = s.firstChild
       const i = pending.indexOf(top)
       if (i >= 0) pending.splice(i, 1)
