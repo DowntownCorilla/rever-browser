@@ -10,6 +10,9 @@ import {
   appendWsFrame,
   appendConsole,
   appendException,
+  mergeExtraResponseHeaders,
+  takePendingExtraResponseHeaders,
+  discardPendingExtraResponseHeaders,
   type StoredRequest
 } from './traffic-store'
 import { STEALTH_INIT_SCRIPT, SPOOFED_CHROME_VERSION, SPOOFED_CHROME_MAJOR } from './stealth-init'
@@ -296,6 +299,13 @@ interface ResponseReceivedParams {
     headers: Record<string, string>
   }
   timestamp: number
+}
+
+interface ResponseReceivedExtraInfoParams {
+  requestId: string
+  statusCode: number
+  headers: Record<string, string>
+  headersText?: string
 }
 
 interface LoadingFinishedParams {
@@ -611,6 +621,11 @@ export function attachCdpCapture(targetId: number, sink: WebContents): boolean {
       // redirectResponse가 없는 최초 요청만 +1 한다.
       if (!p.redirectResponse) {
         bumpInFlight(targetId, +1)
+      } else {
+        // Redirect hops share the requestId — ExtraInfo buffered so far
+        // belongs to the previous hop's response; drop it so it can't be
+        // merged into the final response's headers.
+        discardPendingExtraResponseHeaders(p.requestId)
       }
       const resourceType = p.type ?? 'Other'
       const initiator = p.initiator
@@ -657,7 +672,14 @@ export function attachCdpCapture(targetId: number, sink: WebContents): boolean {
         ...(p.type ? { resourceType: p.type } : {}),
         status: p.response.status,
         mimeType: p.response.mimeType,
-        responseHeaders: p.response.headers
+        // responseReceived headers omit Set-Cookie — merge the raw header block
+        // buffered from responseReceivedExtraInfo (which may arrive first).
+        // ExtraInfo is the authoritative raw block, so it wins on overlap;
+        // the statusCode match keeps a redirect hop's block from landing here.
+        responseHeaders: {
+          ...p.response.headers,
+          ...takePendingExtraResponseHeaders(p.requestId, p.response.status)
+        }
       })
       sink.send('network-event', {
         type: 'response',
@@ -666,6 +688,9 @@ export function attachCdpCapture(targetId: number, sink: WebContents): boolean {
         mime_type: p.response.mimeType,
         timestamp: p.timestamp
       })
+    } else if (method === 'Network.responseReceivedExtraInfo') {
+      const p = params as ResponseReceivedExtraInfoParams
+      mergeExtraResponseHeaders(p.requestId, p.headers, p.statusCode)
     } else if (method === 'Network.loadingFailed') {
       bumpInFlight(targetId, -1)
     } else if (method === 'Network.loadingFinished') {

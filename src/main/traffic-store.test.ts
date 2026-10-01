@@ -11,7 +11,10 @@ import {
   getConsoleSince,
   clearConsole,
   appendException,
-  getExceptions
+  getExceptions,
+  mergeExtraResponseHeaders,
+  takePendingExtraResponseHeaders,
+  discardPendingExtraResponseHeaders
 } from './traffic-store'
 
 beforeEach(() => {
@@ -163,5 +166,128 @@ describe('runtime exceptions', () => {
     // Cap is absolute regardless of prior appends in earlier tests.
     expect(all).toHaveLength(200)
     expect(all.at(-1)?.text).toBe('boom249')
+  })
+})
+
+describe('responseReceivedExtraInfo merge (Set-Cookie capture)', () => {
+  // CDP Network.responseReceived.response.headers omits Set-Cookie; the raw
+  // header block arrives in responseReceivedExtraInfo in either order.
+  const extra = {
+    'Content-Type': 'text/html',
+    'Set-Cookie': 'session=abc; HttpOnly\npref=dark; Secure'
+  }
+
+  it('merges when ExtraInfo arrives before responseReceived', () => {
+    upsertRequest({ requestId: 'r1', url: 'https://a.com/', host: 'a.com' })
+    mergeExtraResponseHeaders('r1', extra, 200)
+    // responseReceived lands: caller merges pending extra headers over the
+    // event's own header map (same shape as chrome-cdp.ts / external-cdp.ts).
+    const pending = takePendingExtraResponseHeaders('r1', 200)
+    upsertRequest({
+      requestId: 'r1',
+      status: 200,
+      responseHeaders: { ...{ 'Content-Type': 'text/html', Server: 'x' }, ...pending }
+    })
+    const h = getRequest('r1')?.responseHeaders ?? {}
+    expect(h['Set-Cookie']).toBe('session=abc; HttpOnly\npref=dark; Secure')
+    expect(h['Server']).toBe('x')
+  })
+
+  it('merges when ExtraInfo arrives after responseReceived', () => {
+    upsertRequest({
+      requestId: 'r2',
+      url: 'https://a.com/',
+      host: 'a.com',
+      status: 200,
+      responseHeaders: { 'Content-Type': 'text/html' }
+    })
+    mergeExtraResponseHeaders('r2', extra, 200)
+    const h = getRequest('r2')?.responseHeaders ?? {}
+    expect(h['Set-Cookie']).toBe('session=abc; HttpOnly\npref=dark; Secure')
+    expect(h['Content-Type']).toBe('text/html')
+    expect(takePendingExtraResponseHeaders('r2', 200)).toBeUndefined()
+  })
+
+  it('returns undefined for requests with no buffered extra info', () => {
+    expect(takePendingExtraResponseHeaders('nope', 200)).toBeUndefined()
+  })
+
+  it('lets the raw ExtraInfo block win over the event header map', () => {
+    upsertRequest({
+      requestId: 'r2b',
+      url: 'https://a.com/',
+      host: 'a.com',
+      status: 200,
+      responseHeaders: { 'X-Shared': 'event-value' }
+    })
+    mergeExtraResponseHeaders('r2b', { 'X-Shared': 'raw-value' }, 200)
+    expect(getRequest('r2b')?.responseHeaders?.['X-Shared']).toBe('raw-value')
+  })
+
+  it('drops a redirect hop ExtraInfo instead of leaking it onto the final response', () => {
+    // Redirect hops share the requestId: /login 302 (Set-Cookie: hop=REDIRECT)
+    // followed by /home 200 (Set-Cookie: hop=FINAL). The 302's raw block must
+    // never land on the 200's stored headers.
+    upsertRequest({ requestId: 'r3', url: 'https://a.com/login', host: 'a.com' })
+    mergeExtraResponseHeaders('r3', { 'Set-Cookie': 'hop=REDIRECT' }, 302)
+    // requestWillBeSent for the next hop carries redirectResponse → discard.
+    discardPendingExtraResponseHeaders('r3')
+    const pending = takePendingExtraResponseHeaders('r3', 200)
+    upsertRequest({
+      requestId: 'r3',
+      status: 200,
+      responseHeaders: { ...{ 'Content-Type': 'text/html' }, ...pending }
+    })
+    // The final hop's own ExtraInfo arrives after and wins.
+    mergeExtraResponseHeaders('r3', { 'Set-Cookie': 'hop=FINAL' }, 200)
+    expect(getRequest('r3')?.responseHeaders?.['Set-Cookie']).toBe('hop=FINAL')
+  })
+
+  it('drops a buffered redirect block whose statusCode does not match', () => {
+    // A 302's ExtraInfo buffered after the redirect requestWillBeSent (or
+    // without one being observed) is still rejected by the status check.
+    upsertRequest({ requestId: 'r4', url: 'https://a.com/login', host: 'a.com' })
+    mergeExtraResponseHeaders('r4', { 'Set-Cookie': 'hop=REDIRECT' }, 302)
+    expect(takePendingExtraResponseHeaders('r4', 200)).toBeUndefined()
+    // Consumed — a later take must not resurrect it.
+    expect(takePendingExtraResponseHeaders('r4', 302)).toBeUndefined()
+  })
+
+  it('drops a late redirect-hop ExtraInfo arriving after the final response', () => {
+    upsertRequest({
+      requestId: 'r5',
+      url: 'https://a.com/home',
+      host: 'a.com',
+      status: 200,
+      responseHeaders: { 'Set-Cookie': 'hop=FINAL' }
+    })
+    mergeExtraResponseHeaders('r5', { 'Set-Cookie': 'hop=REDIRECT' }, 302)
+    expect(getRequest('r5')?.responseHeaders?.['Set-Cookie']).toBe('hop=FINAL')
+  })
+
+  it('keeps the final response headers for same-requestId auth retries', () => {
+    // HTTP auth challenges reuse the requestId without redirectResponse:
+    // 401 → 200. The 200's ExtraInfo can land while the stored status is
+    // still 401 — it must not be dropped as a stale redirect hop.
+    upsertRequest({ requestId: 'r6', url: 'https://a.com/', host: 'a.com' })
+    mergeExtraResponseHeaders('r6', { 'Set-Cookie': 'challenge=1' }, 401)
+    upsertRequest({
+      requestId: 'r6',
+      status: 401,
+      responseHeaders: {
+        ...{ 'WWW-Authenticate': 'Basic' },
+        ...takePendingExtraResponseHeaders('r6', 401)
+      }
+    })
+    mergeExtraResponseHeaders('r6', { 'Set-Cookie': 'hop=FINAL' }, 200)
+    upsertRequest({
+      requestId: 'r6',
+      status: 200,
+      responseHeaders: {
+        ...{ 'Content-Type': 'text/html' },
+        ...takePendingExtraResponseHeaders('r6', 200)
+      }
+    })
+    expect(getRequest('r6')?.responseHeaders?.['Set-Cookie']).toBe('hop=FINAL')
   })
 })
